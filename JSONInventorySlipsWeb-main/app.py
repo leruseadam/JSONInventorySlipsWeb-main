@@ -3,30 +3,75 @@ Flask Inventory Slip Generator - Web application for generating inventory slips
 from CSV and JSON data with support for Bamboo and Cultivera formats.
 """
 
-from flask import Flask, render_template, request, redirect, url_for, flash, jsonify, session, send_file, send_from_directory
+# Standard library imports
 import os
 import sys
 import json
 import datetime
+import socket
+import ssl
+import base64
+import hmac
+import hashlib
+import logging
+import threading
+import tempfile
 import urllib.request
-import pandas as pd
+import urllib.error
+import uuid
+import re
+import webbrowser
+import time
+from functools import wraps
 from io import BytesIO
+import zlib
+
+# Third-party imports
+from flask import (
+    Flask, 
+    render_template, 
+    request, 
+    redirect, 
+    url_for, 
+    flash, 
+    jsonify, 
+    session, 
+    send_file, 
+    send_from_directory
+)
+import requests
+import pandas as pd
 from docxtpl import DocxTemplate
 from docx import Document
 from docx.shared import Pt, Inches
 from docxcompose.composer import Composer
 import configparser
-import tempfile
-import uuid
-import re
-import werkzeug.utils
 from werkzeug.utils import secure_filename
-import logging
-import threading
-import webbrowser
-import time
+
+# Local imports
 from src.utils.document_handler import DocumentHandler
 from src.ui.app import InventorySlipGenerator
+
+
+import sys
+def compress_session_data(data):
+    """Compress data for session storage"""
+    if isinstance(data, str):
+        compressed = zlib.compress(data.encode('utf-8'))
+    else:
+        compressed = zlib.compress(json.dumps(data).encode('utf-8'))
+    return base64.b64encode(compressed).decode('utf-8')
+
+def decompress_session_data(compressed_data):
+    """Decompress data from session storage"""
+    if not compressed_data:
+        return None
+    try:
+        decompressed = zlib.decompress(base64.b64decode(compressed_data))
+        return json.loads(decompressed)
+    except Exception as e:
+        logger.error(f"Failed to decompress session data: {str(e)}")
+        return None
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, 
@@ -82,6 +127,25 @@ except Exception as e:
 APP_VERSION = "2.0.0"
 ALLOWED_EXTENSIONS = {'csv', 'json', 'docx'}
 MAX_CONTENT_LENGTH = 16 * 1024 * 1024  # 16 MB max upload size
+
+# Add new constants for API configuration
+API_CONFIGS = {
+    'bamboo': {
+        'base_url': 'https://api-trace.getbamboo.com/shared/manifests',
+        'version': 'v1',
+        'auth_type': 'bearer'
+    },
+    'cultivera': {
+        'base_url': 'https://api.cultivera.com/api',
+        'version': 'v1',
+        'auth_type': 'basic'
+    },
+    'growflow': {
+        'base_url': 'https://api.growflow.com',
+        'version': 'v2',
+        'auth_type': 'oauth2'
+    }
+}
 
 # Initialize Flask application
 app = Flask(__name__,
@@ -428,29 +492,14 @@ def parse_cultivera_data(json_data):
         raise ValueError(f"Failed to parse Cultivera data: {e}")
 
 def parse_growflow_data(json_data):
-    """
-    Parse GrowFlow JSON format into a DataFrame with common fields:
-      - Product Name*
-      - Product Type*
-      - Quantity Received*
-      - Barcode*
-      - Accepted Date
-      - Vendor
-      - Strain Name
-      - THC Content
-      - CBD Content
-      - Source System
-    """
+    """Parse GrowFlow JSON format into common fields"""
     try:
         if not ('inventory_transfer_items' in json_data and 
                 'from_license_number' in json_data and 
                 'from_license_name' in json_data):
             return pd.DataFrame()
         
-        # Build vendor info using GrowFlow's from_license fields
         vendor_meta = f"{json_data.get('from_license_number', '')} - {json_data.get('from_license_name', 'Unknown Vendor')}"
-        
-        # Determine accepted date from transferred_at or estimated arrival
         raw_date = json_data.get("est_arrival_at", "") or json_data.get("transferred_at", "")
         accepted_date = raw_date.split("T")[0] if "T" in raw_date else raw_date
         
@@ -459,7 +508,6 @@ def parse_growflow_data(json_data):
         
         for item in items:
             potency_data = item.get("lab_result_data", {}).get("potency", [])
-            # Look for total-thc (or fallback to thc) and total-cbd (or cbd)
             thc_value = next((p.get('value') for p in potency_data if p.get('type') in ["total-thc", "thc"]), 0)
             cbd_value = next((p.get('value') for p in potency_data if p.get('type') in ["total-cbd", "cbd"]), 0)
             
@@ -467,7 +515,6 @@ def parse_growflow_data(json_data):
                 "Product Name*": item.get("product_name", ""),
                 "Product Type*": item.get("inventory_type", ""),
                 "Quantity Received*": item.get("qty", ""),
-                # Prefer product_sku first then inventory_id
                 "Barcode*": item.get("product_sku", "") or item.get("inventory_id", ""),
                 "Accepted Date": accepted_date,
                 "Vendor": vendor_meta,
@@ -484,43 +531,44 @@ def parse_growflow_data(json_data):
         logger.error(f"Error parsing GrowFlow data: {str(e)}")
         return pd.DataFrame()
 
-# Detect and parse JSON from multiple systems
 def parse_inventory_json(json_data):
     """
-    Detects the JSON format and parses it accordingly
+    Detects and parses JSON format accordingly
+    Returns tuple of (DataFrame, format_type)
     """
     if not json_data:
         return None, "No data provided"
     
     try:
-        # If data is a string, parse it to JSON
+        # Parse string to JSON if needed
         if isinstance(json_data, str):
             json_data = json.loads(json_data)
-        
+            
         # Try parsing as Bamboo
         if "inventory_transfer_items" in json_data:
             return parse_bamboo_data(json_data), "Bamboo"
-        
-        # Try parsing as Cultivera
+            
+        # Try parsing as Cultivera 
         elif "data" in json_data and isinstance(json_data["data"], dict) and "manifest" in json_data["data"]:
             return parse_cultivera_data(json_data), "Cultivera"
-        
+            
         # Try parsing as GrowFlow
         elif "document_schema_version" in json_data:
             return parse_growflow_data(json_data), "GrowFlow"
-        
-        # Unknown format
+            
         else:
-            return None, "Unknown JSON format. Please use Bamboo or Cultivera format."
-    
+            return None, "Unknown JSON format"
+            
     except json.JSONDecodeError:
-        return None, "Invalid JSON data. Please check the format."
+        return None, "Invalid JSON data"
     except Exception as e:
         return None, f"Error parsing data: {str(e)}"
 
 # Process CSV data
 def process_csv_data(df):
     try:
+        # Strip whitespace from column names
+        df.columns = [col.strip() for col in df.columns]
         logger.info(f"Original columns: {df.columns.tolist()}")
         
         # First, ensure column names are unique by adding a suffix if needed
@@ -617,149 +665,85 @@ def process_csv_data(df):
         logger.error(f"Error in process_csv_data: {str(e)}", exc_info=True)
         return None, f"Failed to process CSV data: {e}"
 
-# Flask Routes
-@app.route('/')
-def index():
-    # Load configuration
-    config = load_config()
+# First, update the chunk size and compression level
+def chunk_session_data(data, chunk_size=3000):
+    """Split large data into smaller chunks with higher compression"""
+    if not isinstance(data, str):
+        data = json.dumps(data)
     
-    # Load any previously saved data from session
-    df_json = session.get('df_json', None)
-    format_type = session.get('format_type', None)
+    # Use higher compression level (9 is highest)
+    compressed = zlib.compress(data.encode('utf-8'), level=9)
+    encoded = base64.b64encode(compressed).decode('utf-8')
     
-    return render_template(
-        'index.html',
-        version=APP_VERSION,
-        theme=config['SETTINGS'].get('theme', 'dark'),
-        df_json=df_json,
-        format_type=format_type,
-        config=config  # Pass the application config instead of Flask config
-    )
-
-@app.route('/upload-csv', methods=['POST'])
-def upload_csv():
-    if 'file' not in request.files:
-        logger.error('No file part in request')
-        flash('No file part')
-        return redirect(request.url)
+    # Calculate optimal chunk size
+    total_size = len(encoded)
+    num_chunks = (total_size + chunk_size - 1) // chunk_size
+    if num_chunks * 40 + total_size > 4000:  # Account for chunk metadata
+        chunk_size = max(1000, (4000 - num_chunks * 40) // num_chunks)
     
-    file = request.files['file']
-    logger.info(f'Received file: {file.filename}')
-    
-    if file.filename == '':
-        logger.error('No selected file')
-        flash('No selected file')
-        return redirect(request.url)
-    
-    if file and allowed_file(file.filename):
-        try:
-            # Read CSV
-            logger.info('Reading CSV file')
-            df = pd.read_csv(file)
-            logger.info(f'CSV columns: {df.columns.tolist()}')
-            
-            # Process CSV
-            logger.info('Processing CSV data')
-            result_df, message = process_csv_data(df)
-            
-            if result_df is None:
-                logger.error(f'Error processing CSV: {message}')
-                flash(f'Error: {message}')
-                return redirect(url_for('index'))
-            
-            # Store in session (convert DataFrame to JSON for storage)
-            logger.info('Converting DataFrame to JSON')
-            session['df_json'] = result_df.to_json(orient='records')
-            session['format_type'] = 'CSV'
-            
-            flash('CSV file processed successfully')
-            return redirect(url_for('data_view'))
-        
-        except Exception as e:
-            logger.error(f'Error processing file: {str(e)}', exc_info=True)
-            flash(f'Error processing file: {str(e)}')
-            return redirect(url_for('index'))
-    
-    logger.error(f'Invalid file type: {file.filename}')
-    flash('Invalid file type. Please upload a CSV file')
-    return redirect(url_for('index'))
-
-@app.route('/upload-json', methods=['POST'])
-def upload_json():
-    if 'file' not in request.files:
-        flash('No file part')
-        return redirect(request.url)
-    
-    file = request.files['file']
-    
-    if file.filename == '':
-        flash('No selected file')
-        return redirect(request.url)
-    
-    if file and allowed_file(file.filename):
-        try:
-            # Read JSON
-            json_data = json.load(file)
-            
-            # Process JSON
-            result_df, format_type = parse_inventory_json(json_data)
-            
-            if result_df is None:
-                flash(f'Error: {format_type}')
-                return redirect(url_for('index'))
-            
-            # Store in session
-            session['df_json'] = result_df.to_json(orient='records')
-            session['format_type'] = format_type
-            session['raw_json'] = json.dumps(json_data)
-            
-            flash(f'{format_type} data processed successfully')
-            return redirect(url_for('data_view'))
-        
-        except Exception as e:
-            flash(f'Error processing JSON file: {str(e)}')
-            return redirect(url_for('index'))
-    
-    flash('Invalid file type. Please upload a JSON file')
-    return redirect(url_for('index'))
+    chunks = [encoded[i:i+chunk_size] for i in range(0, len(encoded), chunk_size)]
+    return chunks
 
 @app.route('/paste-json', methods=['POST'])
 def paste_json():
     try:
-        json_data = request.form.get('json_text', '')
-        api_format = request.form.get('api_format', 'auto')
-        
-        # Process JSON based on format
-        if api_format == 'bamboo':
-            data = json.loads(json_data)
-            result_df = parse_bamboo_data(data)
-            format_type = 'Bamboo'
-        elif api_format == 'cultivera':
-            data = json.loads(json_data)
-            result_df = parse_cultivera_data(data)
-            format_type = 'Cultivera'
-        else:
-            # Auto-detect format
-            result_df, format_type = parse_inventory_json(json_data)
-        
+        data = request.get_json()
+        pasted_json = data.get('json_data', '')
+        if not pasted_json:
+            return jsonify({'success': False, 'message': 'No JSON data provided.'}), 400
+
+        try:
+            parsed = json.loads(pasted_json)
+        except Exception as e:
+            return jsonify({'success': False, 'message': f'Invalid JSON: {str(e)}'}), 400
+
+        result_df, format_type = parse_inventory_json(parsed)
         if result_df is None or result_df.empty:
-            flash(f'Could not process {api_format} data')
-            return redirect(url_for('index'))
-        
-        # Store in session
+            return jsonify({'success': False, 'message': 'Could not process pasted JSON data.'}), 400
+
         session['df_json'] = result_df.to_json(orient='records')
         session['format_type'] = format_type
-        session['raw_json'] = json_data
-        
-        flash(f'{format_type} data imported successfully')
-        return redirect(url_for('data_view'))
-    
+        session['raw_json'] = pasted_json
+
+        return jsonify({'success': True, 'redirect': url_for('data_view')})
     except Exception as e:
-        flash(f'Failed to import data: {str(e)}')
+        return jsonify({'success': False, 'message': f'Error: {str(e)}'}), 500
+
+@app.route('/upload-csv', methods=['POST'])
+def upload_csv():
+    if 'file' not in request.files:
+        flash('No file part')
+        return redirect(url_for('index'))
+    file = request.files['file']
+    if file.filename == '':
+        flash('No selected file')
+        return redirect(url_for('index'))
+    if file and allowed_file(file.filename):
+        filename = secure_filename(file.filename)
+        filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        file.save(filepath)
+        try:
+            df = pd.read_csv(filepath)
+            processed_df, msg = process_csv_data(df)
+            if processed_df is None:
+                flash(msg)
+                return redirect(url_for('index'))
+            session['df_json'] = processed_df.to_json(orient='records')
+            session['format_type'] = 'CSV'
+            session['raw_json'] = df.to_json(orient='records')
+            flash('CSV uploaded and processed successfully')
+            return redirect(url_for('data_view'))
+        except Exception as e:
+            flash(f'Failed to process CSV: {str(e)}')
+            return redirect(url_for('index'))
+    else:
+        flash('Invalid file type')
         return redirect(url_for('index'))
 
+# Then, update the URL loading function
 @app.route('/load-url', methods=['POST'])
 def load_url():
+    """Handle URL loading with proper error handling"""
     try:
         url = request.form.get('url', '').strip()
         
@@ -767,267 +751,134 @@ def load_url():
             flash('Please enter a URL', 'error')
             return redirect(url_for('index'))
         
+        # Clear any existing session data
+        clear_chunked_data('df_json')
+        clear_chunked_data('raw_json')
+        session.pop('format_type', None)
+        
+        # Handle different URL types
         if "bamboo" in url.lower() or "getbamboo" in url.lower():
             return handle_bamboo_url(url)
         else:
-            return load_from_url(url)
+            result_df, format_type = load_from_url(url)
             
+            if result_df is None or result_df.empty:
+                flash('Could not process data from URL', 'error')
+                return redirect(url_for('index'))
+            
+            # Store compressed results in chunks
+            logger.info("Storing URL data in chunks...")
+            store_chunked_data('df_json', result_df.to_json(orient='records', default_handler=str))
+            session['format_type'] = format_type
+            
+            flash(f'{format_type} data loaded successfully', 'success')
+            return redirect(url_for('data_view'))
+            
+    except ValueError as ve:
+        logger.error(f'URL validation error: {str(ve)}')
+        flash(str(ve), 'error')
+        return redirect(url_for('index'))
     except Exception as e:
         logger.error(f'Error loading URL: {str(e)}', exc_info=True)
         flash(f'Error loading data: {str(e)}', 'error')
         return redirect(url_for('index'))
+    
+def handle_bamboo_url(url):
+    try:
+        result_df, format_type = load_from_url(url)
+        if result_df is None or result_df.empty:
+            flash('Could not process Bamboo data from URL', 'error')
+            return redirect(url_for('index'))
+        store_chunked_data('df_json', result_df.to_json(orient='records', default_handler=str))
+        session['format_type'] = format_type
+        flash(f'{format_type} data loaded successfully', 'success')
+        return redirect(url_for('data_view'))
+    except Exception as e:
+        logger.error(f'Error loading Bamboo URL: {str(e)}', exc_info=True)
+        flash(f'Error loading Bamboo data: {str(e)}', 'error')
+        return redirect(url_for('index'))
 
 def load_from_url(url):
-    if not url.startswith(('http://', 'https://')):
-        flash('Please enter a valid URL starting with http:// or https://', 'error')
-        return redirect(url_for('index'))
-
+    """Download JSON or CSV data from a URL and return as DataFrame and format_type."""
     try:
-        import ssl
-        # Create an SSL context that does not verify certificates
-        ssl_context = ssl.create_default_context()
-        ssl_context.check_hostname = False
-        ssl_context.verify_mode = ssl.CERT_NONE
-
-        headers = {
-            'User-Agent': f'InventorySlipGenerator/{APP_VERSION}',
-            'Accept': 'application/json'
-        }
-        req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, context=ssl_context, timeout=10) as resp:
-            raw_data = resp.read()
-            if not raw_data:
-                raise ValueError("Empty response received")
-            decoded_data = raw_data.decode('utf-8', errors='strict').strip()
-            if not decoded_data:
-                raise ValueError("Empty response after decoding")
-            # Attempt to load the JSON; log a snippet if it fails
+        response = requests.get(url, timeout=30)
+        response.raise_for_status()
+        content_type = response.headers.get('Content-Type', '').lower()
+        if 'application/json' in content_type or url.lower().endswith('.json'):
+            data = response.json()
+            df, format_type = parse_inventory_json(data)
+            return df, format_type
+        elif 'text/csv' in content_type or url.lower().endswith('.csv'):
+            df = pd.read_csv(BytesIO(response.content))
+            df, msg = process_csv_data(df)
+            return df, 'CSV'
+        else:
+            # Try to parse as JSON first, then CSV
             try:
-                data = json.loads(decoded_data)
-            except json.JSONDecodeError as jde:
-                logger.error("JSON decoding error. Response snippet:\n%s", decoded_data[:200])
-                raise ValueError(f"Invalid JSON format: {str(jde)}")
-            
-            if not isinstance(data, (dict, list)):
-                raise ValueError("Invalid JSON structure - expecting object or array")
-            
-            result_df, format_type = parse_inventory_json(data)
-            if result_df is None or result_df.empty:
-                raise ValueError(f"Could not process data: {format_type}")
-            
-            session['df_json'] = result_df.to_json(orient='records')
-            session['format_type'] = format_type
-            session['raw_json'] = json.dumps(data)
-            
-            flash(f'{format_type} data loaded successfully', 'success')
-            return redirect(url_for('data_view'))
+                data = response.json()
+                df, format_type = parse_inventory_json(data)
+                return df, format_type
+            except Exception:
+                try:
+                    df = pd.read_csv(BytesIO(response.content))
+                    df, msg = process_csv_data(df)
+                    return df, 'CSV'
+                except Exception as e:
+                    raise ValueError(f"Unsupported data format or failed to parse: {e}")
     except Exception as e:
-        logger.error(f'Error loading URL: {str(e)}', exc_info=True)
-        flash(f'Failed to load data: {str(e)}', 'error')
-        return redirect(url_for('index'))
-
-def handle_bamboo_url(url):
-    """Handle Bamboo-specific URL loading with API key support"""
-    try:
-        import ssl
-        # Create an SSL context that does not verify certificates
-        ssl_context = ssl.create_default_context()
-        ssl_context.check_hostname = False
-        ssl_context.verify_mode = ssl.CERT_NONE
-
-        # Set up headers
-        headers = {
-            'User-Agent': f'InventorySlipGenerator/{APP_VERSION}',
-            'Accept': 'application/json',
-            'Content-Type': 'application/json'
-        }
-        
-        # Check for API key
-        config = load_config()
-        if 'API' in config and config['API'].get('bamboo_key'):
-            headers['Authorization'] = f"Bearer {config['API']['bamboo_key']}"
-        
-        # Fetch data using our SSL context
-        req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, context=ssl_context, timeout=10) as resp:
-            data = json.loads(resp.read().decode())
-            
-        # Process Bamboo data
-        result_df = parse_bamboo_data(data)
-        if result_df is None or result_df.empty:
-            flash('Could not process Bamboo data', 'error')
-            return redirect(url_for('index'))
-        
-        # Store in session
-        session['df_json'] = result_df.to_json(orient='records')
-        session['format_type'] = 'Bamboo'
-        session['raw_json'] = json.dumps(data)
-        
-        # Cache the response (optional)
-        cache_dir = os.path.join(os.path.expanduser("~"), ".inventory_slip_cache")
-        os.makedirs(cache_dir, exist_ok=True)
-        with open(os.path.join(cache_dir, "bamboo_latest.json"), 'w') as f:
-            json.dump(data, f)
-        
-        # Update recent URLs
-        recent_urls = config['PATHS'].get('recent_urls', '').split('|')
-        recent_urls = [u for u in recent_urls if u]
-        if url not in recent_urls:
-            recent_urls.insert(0, url)
-            recent_urls = recent_urls[:10]
-            config['PATHS']['recent_urls'] = '|'.join(recent_urls)
-            save_config(config)
-        
-        flash('Bamboo data loaded successfully', 'success')
-        return redirect(url_for('data_view'))
-        
-    except urllib.error.HTTPError as e:
-        if e.code == 403:
-            return handle_bamboo_forbidden()
-        flash(f'API Error: {e.code} - {e.reason}', 'error')
-        return redirect(url_for('index'))
-    except Exception as e:
-        logger.error(f'Error loading Bamboo data: {str(e)}', exc_info=True)
-        flash(f'Failed to load Bamboo data: {str(e)}', 'error')
-        return redirect(url_for('index'))
-
-def handle_bamboo_forbidden():
-    """Handle forbidden Bamboo API access by using cached data"""
-    try:
-        cache_file = os.path.join(os.path.expanduser("~"), ".inventory_slip_cache", "bamboo_latest.json")
-        
-        if os.path.exists(cache_file):
-            with open(cache_file, 'r') as f:
-                data = json.load(f)
-            
-            result_df = parse_bamboo_data(data)
-            
-            if result_df is None or result_df.empty:
-                flash('Could not process cached Bamboo data', 'error')
-                return redirect(url_for('index'))
-            
-            session['df_json'] = result_df.to_json(orient='records')
-            session['format_type'] = 'Bamboo'
-            session['raw_json'] = json.dumps(data)
-            
-            flash('Using cached Bamboo data (API access forbidden). Please check your API credentials.', 'warning')
-            return redirect(url_for('data_view'))
-        else:
-            flash('No cached Bamboo data available. Please check your API credentials.', 'error')
-            return redirect(url_for('index'))
-            
-    except Exception as e:
-        logger.error(f'Error loading cached data: {str(e)}', exc_info=True)
-        flash(f'Failed to load cached data: {str(e)}', 'error')
-        return redirect(url_for('index'))
-
-@app.route('/fetch-api', methods=['POST'])
-def fetch_api():
-    url = request.form.get('url', '')
-    api_type = request.form.get('api_type', 'auto')
-    api_key = request.form.get('api_key', '')
+        raise ValueError(f"Failed to load data from URL: {e}")
     
-    if not url:
-        flash('Please enter an API URL')
-        return redirect(url_for('index'))
-    
-    try:
-        # Set up headers
-        headers = {
-            "User-Agent": "InventorySlipGenerator/2.0.0",
-            "Accept": "application/json",
-            "Content-Type": "application/json"
-        }
-        
-        if api_key:
-            headers["Authorization"] = f"Bearer {api_key}"
-        
-        # Save API key to config
-        config = load_config()
-        if 'API' not in config:
-            config['API'] = {}
-        config['API']['bamboo_key'] = api_key
-        save_config(config)
-        
-        # Fetch data
-        req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req) as resp:
-            data = json.loads(resp.read().decode())
-        
-        # Process based on API type
-        if api_type == 'bamboo':
-            result_df = parse_bamboo_data(data)
-            format_type = 'Bamboo'
-        elif api_type == 'cultivera':
-            result_df = parse_cultivera_data(data)
-            format_type = 'Cultivera'
-        else:
-            # Auto-detect
-            result_df, format_type = parse_inventory_json(data)
-        
-        if result_df is None or result_df.empty:
-            flash(f'Could not process {api_type} data')
-            return redirect(url_for('index'))
-        
-        # Store in session
-        session['df_json'] = result_df.to_json(orient='records')
-        session['format_type'] = format_type
-        session['raw_json'] = json.dumps(data)
-        
-        # Add to recent URLs
-        recent_urls = config['PATHS'].get('recent_urls', '').split('|')
-        recent_urls = [u for u in recent_urls if u]
-        if url not in recent_urls:
-            recent_urls.insert(0, url)
-            recent_urls = recent_urls[:10]  # Keep only 10 most recent
-            config['PATHS']['recent_urls'] = '|'.join(recent_urls)
-            save_config(config)
-        
-        flash(f'{format_type} data fetched successfully from API')
-        return redirect(url_for('data_view'))
-    
-    except Exception as e:
-        flash(f'Failed to fetch API data: {str(e)}')
-        return redirect(url_for('index'))
 
+
+# Update data view to handle chunked data properly
 @app.route('/data-view')
 def data_view():
-    # Load data from session
-    df_json = session.get('df_json', None)
-    format_type = session.get('format_type', None)
+    try:
+        # Get chunked data from session
+        df_json = get_chunked_data('df_json')
+        format_type = session.get('format_type')
 
-    if df_json is None:
-        flash('No data available. Please load data first.')
+        if df_json is None:
+            flash('No data available. Please load data first.')
+            return redirect(url_for('index'))
+
+        try:
+            if isinstance(df_json, list):
+                df = pd.DataFrame(df_json)
+            else:
+                df = pd.read_json(df_json, orient='records')
+        except Exception as e:
+            logger.error(f"Error parsing JSON data: {str(e)}")
+            flash('Error loading data. Please try again.')
+            return redirect(url_for('index'))
+        
+        # Format data for template
+        products = []
+        for idx, row in df.iterrows():
+            product = {
+                'id': idx,
+                'name': str(row.get('Product Name*', '')),
+                'strain': str(row.get('Strain Name', '')),
+                'sku': str(row.get('Barcode*', '')),
+                'quantity': str(row.get('Quantity Received*', '')),
+                'source': format_type or 'Unknown'
+            }
+            products.append(product)
+
+        # Load configuration
+        config = load_config()
+
+        return render_template(
+            'data_view.html',
+            products=products,
+            format_type=format_type,
+            theme=config['SETTINGS'].get('theme', 'dark'),
+            version=APP_VERSION
+        )
+    except Exception as e:
+        logger.error(f'Error in data_view: {str(e)}', exc_info=True)
+        flash('Error loading data. Please try again.')
         return redirect(url_for('index'))
-
-    # Convert JSON to DataFrame
-    df = pd.read_json(df_json, orient='records')
-    # Debug log - check columns from parsed data
-    logger.info(f"DataFrame columns: {df.columns.tolist()}")
-
-    # Format data for template
-    products = []
-    for idx, row in df.iterrows():
-        product = {
-            'id': idx,
-            'name': row.get('Product Name*', ''),
-            'strain': row.get('Strain Name', ''),
-            'sku': row.get('Barcode*', ''),
-            'quantity': row.get('Quantity Received*', ''),
-            'source': format_type or 'Unknown'
-        }
-        products.append(product)
-
-    # Load configuration
-    config = load_config()
-
-    return render_template(
-        'data_view.html',
-        products=products,
-        format_type=format_type,
-        theme=config['SETTINGS'].get('theme', 'dark'),
-        version=APP_VERSION
-    )
 
 @app.route('/generate-slips', methods=['POST'])
 def generate_slips():
@@ -1181,10 +1032,10 @@ def view_json():
 
 @app.route('/clear-data')
 def clear_data():
-    # Clear session data
-    session.pop('df_json', None)
+    # Clear chunked session data
+    clear_chunked_data('df_json')
+    clear_chunked_data('raw_json')
     session.pop('format_type', None)
-    session.pop('raw_json', None)
     session.pop('output_file', None)
     
     flash('Data cleared successfully')
@@ -1197,6 +1048,16 @@ def about():
         'about.html',
         version=APP_VERSION,
         theme=config['SETTINGS'].get('theme', 'dark')
+    )
+
+@app.route('/')
+def index():
+    config = load_config()
+    return render_template(
+        'index.html',
+        config=config,
+        theme=config['SETTINGS'].get('theme', 'dark'),
+        version=APP_VERSION
     )
 
 @app.route('/search-json-or-api', methods=['POST'])
@@ -1297,32 +1158,310 @@ def open_downloads():
     except Exception as e:
         return jsonify(success=False, message=str(e))
 
-if __name__ == "__main__":
-    import webbrowser
-    import socket
+def create_api_signature(secret_key, message):
+    """Create HMAC signature for API requests"""
+    key = secret_key.encode('utf-8')
+    message = message.encode('utf-8')
+    signature = hmac.new(key, message, hashlib.sha256).hexdigest()
+    return signature
 
-    # Find an available port
-    ports = [5000, 8000, 8080, 8888]
-    chosen_port = None
+def require_api_key(f):
+    """Decorator to require API key for certain routes"""
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        config = load_config()
+        api_type = request.args.get('api_type', 'bamboo')
+        
+        if 'API' not in config or f'{api_type}_key' not in config['API']:
+            flash(f'No API key configured for {api_type}. Please add it in settings.')
+            return redirect(url_for('settings'))
+        return f(*args, **kwargs)
+    return decorated_function
 
-    for port in ports:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+class APIClient:
+    def __init__(self, api_type, config):
+        self.api_type = api_type
+        self.config = config
+        self.api_config = API_CONFIGS.get(api_type)
+        if not self.api_config:
+            raise ValueError(f"Unsupported API type: {api_type}")
+        
+    def get_headers(self):
+        """Get headers for API request based on API type"""
+        headers = {
+            'User-Agent': f'InventorySlipGenerator/{APP_VERSION}',
+            'Accept': 'application/json',
+            'Content-Type': 'application/json'
+        }
+        
+        api_key = self.config['API'].get(f'{self.api_type}_key')
+        if not api_key:
+            return headers
+            
+        if self.api_config['auth_type'] == 'bearer':
+            headers['Authorization'] = f'Bearer {api_key}'
+        elif self.api_config['auth_type'] == 'basic':
+            encoded = base64.b64encode(f'{api_key}:'.encode()).decode()
+            headers['Authorization'] = f'Basic {encoded}'
+        
+        return headers
+    
+    def make_request(self, endpoint, method='GET', params=None, data=None):
+        """Make API request with proper error handling"""
+        """Make API request with proper error handling"""
+        url = f"{self.api_config['base_url']}/{self.api_config['version']}/{endpoint}"
+        headers = self.get_headers()
+        
         try:
-            sock.bind(('localhost', port))
-            chosen_port = port
-            break
-        except OSError:
-            continue
-        finally:
-            sock.close()
+            response = requests.request(
+                method=method,
+                url=url,
+                headers=headers,
+                params=params,
+                json=data,
+                timeout=30
+            )
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.RequestException as e:
+            logger.error(f"API request failed: {str(e)}")
+            raise
 
-    if chosen_port is None:
-        print("No available ports found")
+# Add these new routes
+
+@app.route('/api/fetch-transfers', methods=['POST'])
+@require_api_key
+def fetch_transfers():
+    """Fetch transfer data from selected API"""
+    try:
+        api_type = request.form.get('api_type', 'bamboo')
+        date_from = request.form.get('date_from')
+        date_to = request.form.get('date_to')
+        
+        config = load_config()
+        client = APIClient(api_type, config)
+        
+        # Fetch data based on API type
+        if api_type == 'bamboo':
+            data = client.make_request('transfers', params={'start_date': date_from, 'end_date': date_to})
+            result_df = parse_bamboo_data(data)
+        elif api_type == 'cultivera':
+            data = client.make_request('manifests', params={'fromDate': date_from, 'toDate': date_to})
+            result_df = parse_cultivera_data(data)
+        elif api_type == 'growflow':
+            data = client.make_request('inventory/transfers', params={'dateStart': date_from, 'dateEnd': date_to})
+            result_df = parse_growflow_data(data)
+        else:
+            return jsonify({'error': 'Unsupported API type'}), 400
+        
+        if result_df is None or result_df.empty:
+            return jsonify({'error': 'No data found'}), 404
+            
+        # Store in session
+        session['df_json'] = result_df.to_json(orient='records')
+        session['format_type'] = api_type
+        session['raw_json'] = json.dumps(data)
+        
+        return jsonify({
+            'success': True,
+            'message': f'Successfully fetched {len(result_df)} records',
+            'redirect': url_for('data_view')
+        })
+        
+    except Exception as e:
+        logger.error(f"API fetch error: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/validate-key', methods=['POST'])
+def validate_api_key():
+    """Validate API key for selected service"""
+    try:
+        api_type = request.form.get('api_type')
+        api_key = request.form.get('api_key')
+        
+        if not api_type or not api_key:
+            return jsonify({'valid': False, 'message': 'Missing required parameters'}), 400
+            
+        config = load_config()
+        client = APIClient(api_type, {'API': {f'{api_type}_key': api_key}})
+        
+        # Try to make a test request
+        if api_type == 'bamboo':
+            client.make_request('status')
+        elif api_type == 'cultivera':
+            client.make_request('health')
+        elif api_type == 'growflow':
+            client.make_request('ping')
+        
+        # If we get here, the key is valid
+        if 'API' not in config:
+            config['API'] = {}
+        config['API'][f'{api_type}_key'] = api_key
+        save_config(config)
+        
+        return jsonify({
+            'valid': True,
+            'message': f'{api_type.title()} API key validated and saved'
+        })
+        
+    except requests.exceptions.HTTPError as e:
+        if e.response.status_code == 401:
+            return jsonify({
+                'valid': False,
+                'message': 'Invalid API key'
+            }), 401
+        return jsonify({
+            'valid': False,
+            'message': f'API error: {str(e)}'
+        }), e.response.status_code
+    except Exception as e:
+        return jsonify({
+            'valid': False,
+            'message': f'Validation error: {str(e)}'
+        }), 500
+        
+
+@app.route('/api/settings', methods=['GET', 'POST'])
+def api_settings():
+    """Manage API settings"""
+    config = load_config()
+    
+    if request.method == 'POST':
+        api_type = request.form.get('api_type')
+        api_key = request.form.get('api_key')
+        
+        if api_type and api_key:
+            if 'API' not in config:
+                config['API'] = {}
+            config['API'][f'{api_type}_key'] = api_key
+            save_config(config)
+            
+            flash(f'{api_type.title()} API key updated successfully')
+            return redirect(url_for('settings'))
+            
+    # Get current API keys
+    api_keys = {
+        'bamboo': config.get('API', {}).get('bamboo_key', ''),
+        'cultivera': config.get('API', {}).get('cultivera_key', ''),
+        'growflow': config.get('API', {}).get('growflow_key', '')
+    }
+    
+    return render_template(
+        'api_settings.html',
+        api_keys=api_keys,
+        theme=config['SETTINGS'].get('theme', 'dark'),
+        version=APP_VERSION
+    )
+
+# Add these error handlers
+
+class APIError(Exception):
+    """Base class for API-related errors"""
+    pass
+
+class APIAuthError(APIError):
+    """Authentication error"""
+    pass
+
+class APIRateLimit(APIError):
+    """Rate limit exceeded"""
+    pass
+
+class APIDataError(APIError):
+    """Data processing error"""
+    pass
+
+@app.errorhandler(APIError)
+def handle_api_error(error):
+    if isinstance(error, APIAuthError):
+        flash('API authentication failed. Please check your API key.', 'error')
+    elif isinstance(error, APIRateLimit):
+        flash('API rate limit exceeded. Please try again later.', 'error')
+    elif isinstance(error, APIDataError):
+        flash('Error processing API data. Please check the format.', 'error')
+    else:
+        flash(f'API Error: {str(error)}', 'error')
+    
+    return redirect(url_for('index'))
+
+# Add these helper functions after your imports section
+def chunk_session_data(data, chunk_size=3000):
+    """Split large data into smaller chunks with higher compression"""
+    if not isinstance(data, str):
+        data = json.dumps(data)
+    
+    # Use higher compression level (9 is highest)
+    compressed = zlib.compress(data.encode('utf-8'), level=9)
+    encoded = base64.b64encode(compressed).decode('utf-8')
+    
+    # Calculate optimal chunk size
+    total_size = len(encoded)
+    num_chunks = (total_size + chunk_size - 1) // chunk_size
+    if num_chunks * 40 + total_size > 4000:  # Account for chunk metadata
+        chunk_size = max(1000, (4000 - num_chunks * 40) // num_chunks)
+    
+    chunks = [encoded[i:i+chunk_size] for i in range(0, len(encoded), chunk_size)]
+    return chunks
+
+def store_chunked_data(key, data):
+    """Store large data in session using chunks"""
+    chunks = chunk_session_data(data)
+    for i, chunk in enumerate(chunks):
+        session[f'{key}_chunk_{i}'] = chunk
+    session[f'{key}_chunks'] = len(chunks)
+
+def get_chunked_data(key):
+    """Retrieve and reconstruct chunked data from session"""
+    try:
+        num_chunks = session.get(f'{key}_chunks')
+        if not num_chunks:
+            return None
+            
+        chunks = []
+        for i in range(num_chunks):
+            chunk = session.get(f'{key}_chunk_{i}')
+            if chunk is None:
+                return None
+            chunks.append(chunk)
+        
+        encoded = ''.join(chunks)
+        compressed = base64.b64decode(encoded)
+        decompressed = zlib.decompress(compressed)
+        return json.loads(decompressed)
+    except Exception as e:
+        logger.error(f"Error retrieving chunked data: {str(e)}")
+        return None
+
+def clear_chunked_data(key):
+    """Clear all chunks for a given key from session"""
+    num_chunks = session.get(f'{key}_chunks', 0)
+    for i in range(num_chunks):
+        session.pop(f'{key}_chunk_{i}', None)
+    session.pop(f'{key}_chunks', None)
+
+if __name__ == '__main__':
+    try:
+        # Try different ports in case default is taken
+        ports = [5001, 8000, 8080, 8888]
+        
+        for port in ports:
+            try:
+                # Open browser after slight delay to ensure server is running
+                threading.Timer(1.5, lambda: webbrowser.open(f'http://localhost:{port}')).start()
+                
+                app.run(
+                    host='localhost',
+                    port=port,
+                    debug=True,
+                    use_reloader=False  # Prevent duplicate browser windows
+                )
+                break  # If server starts successfully, break the loop
+                
+            except OSError:
+                if port == ports[-1]:  # If we've tried all ports
+                    print("Could not find an available port. Please try again.")
+                continue
+                
+    except Exception as e:
+        print(f"Failed to start server: {str(e)}")
         sys.exit(1)
-
-    # Open browser after a short delay
-    url = f'http://localhost:{chosen_port}'
-    threading.Timer(1.5, lambda: webbrowser.open(url)).start()
-
-    # Run the Flask app
-    app.run(host='localhost', port=chosen_port, debug=False)
